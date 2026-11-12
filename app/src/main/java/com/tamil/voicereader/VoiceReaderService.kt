@@ -46,11 +46,10 @@ class VoiceReaderService : AccessibilityService(), TextToSpeech.OnInitListener {
     private val mainHandler = Handler(Looper.getMainLooper())
 
     private var sentencesList = mutableListOf<String>()
-    private var rawScreenDump = ""
     private var currentIndex = 0
     private var isPaused = false
-    private var isRestartingUtterance = false
-    private var speechRate = 1.05f
+    private var manualStopOrJump = false
+    private var speechRate = 1.0f
 
     override fun onServiceConnected() {
         super.onServiceConnected()
@@ -61,12 +60,11 @@ class VoiceReaderService : AccessibilityService(), TextToSpeech.OnInitListener {
     override fun onInit(status: Int) {
         if (status == TextToSpeech.SUCCESS) {
             tts?.setLanguage(Locale("ta", "IN"))
-            tts?.setPitch(1.02f)
             tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
                 override fun onStart(utteranceId: String?) {}
                 override fun onDone(utteranceId: String?) {
-                    if (isRestartingUtterance) {
-                        isRestartingUtterance = false
+                    if (manualStopOrJump) {
+                        manualStopOrJump = false
                         return
                     }
                     if (!isPaused) {
@@ -91,11 +89,12 @@ class VoiceReaderService : AccessibilityService(), TextToSpeech.OnInitListener {
             gravity = Gravity.START
         }
 
+        // 15% opacity when idle so it stays nearly invisible
         floatingOrb = ImageView(this).apply {
             setImageResource(android.R.drawable.ic_btn_speak_now)
             setColorFilter(Color.WHITE)
             setPadding(28, 28, 28, 28)
-            alpha = 0.22f
+            alpha = 0.15f
             background = GradientDrawable().apply {
                 shape = GradientDrawable.OVAL
                 setColor(Color.parseColor("#6200EE"))
@@ -130,7 +129,7 @@ class VoiceReaderService : AccessibilityService(), TextToSpeech.OnInitListener {
         }
         btnSpeed = createBtn("1.0x") { cycleSpeed() }
         val btnExplain = createBtn("🧠 புரியவை") {
-            smartAnalyzeScreen("திரையில் உள்ள முக்கியமான பதிலை மட்டும் எடுத்து, ஒரு நண்பன் பக்கத்துல இருந்து இயல்பா தமிழ்ல (தேவைப்பட்டா ஆங்கில வார்த்தைகளோட) 3 வரிகளில் புரிய வை. பயனர் கேட்ட கேள்வியைத் திரும்பச் சொல்லாதே.")
+            askGroqAI("திரையில் உள்ள முக்கியமான பதிலை மட்டும் எடுத்து, ஒரு நண்பன் பக்கத்துல இருந்து இயல்பா தமிழ்ல (தேவைப்பட்டா ஆங்கில வார்த்தைகளோட) 3 வரிகளில் சுருக்கமாகப் புரிய வை.")
         }
         val btnTalk = createBtn("🎙️ பேசு") { startLiveVoiceChat() }
         val btnClose = createBtn("❌") { stopAndHide() }
@@ -191,7 +190,7 @@ class VoiceReaderService : AccessibilityService(), TextToSpeech.OnInitListener {
                     if (!moved) {
                         if (isLong) startLiveVoiceChat() else onOrbSingleTap()
                     } else if (controlPanel.visibility != View.VISIBLE) {
-                        floatingOrb.alpha = 0.22f
+                        floatingOrb.alpha = 0.15f
                     }
                     true
                 }
@@ -218,102 +217,57 @@ class VoiceReaderService : AccessibilityService(), TextToSpeech.OnInitListener {
             controlPanel.visibility = if (controlPanel.visibility == View.VISIBLE) View.GONE else View.VISIBLE
             return
         }
-        // Single tap immediately uses Smart AI Analyze so it reads ChatGPT/Gemini answers naturally, never robotic!
-        smartAnalyzeScreen("திரையில் இருக்கும் AI பதில் அல்லது கட்டுரையை மட்டும் எடுத்து, கேள்வியைத் தவிர்த்துவிட்டு, இயல்பான தமிழில் (ஆங்கிலக் கட்டுரையாக இருந்தால் தெளிவான ஆங்கிலம் அல்லது தமிழில்) சுருக்கமாகவும் சுவாரஸ்யமாகவும் வாசித்துச் சொல்.")
+        // Instant reliable reading first!
+        val screenText = extractCleanScreenText()
+        if (screenText.isBlank()) {
+            Toast.makeText(this, "திரையில் வாசிக்க எழுத்துக்கள் இல்லை", Toast.LENGTH_SHORT).show()
+            floatingOrb.alpha = 0.15f
+            return
+        }
+        startSpeakingText(screenText)
     }
 
-    private fun captureDeepScreenText(): String {
+    private fun extractCleanScreenText(): String {
         val rootNode = rootInActiveWindow ?: return ""
-        val bag = LinkedHashSet<String>()
-        walkTree(rootNode, bag)
-        return bag.joinToString("\n")
+        val blocks = mutableListOf<String>()
+        collectVisibleNodes(rootNode, blocks)
+
+        val noise = listOf(
+            "Ask Gemini", "Message ChatGPT", "Reply to Claude", "Gemini is AI",
+            "ChatGPT can make mistakes", "Sponsored", "New chat", "Search or type URL"
+        )
+        val cleanBlocks = blocks.distinct().filter { b ->
+            b.length > 6 && noise.none { n -> b.contains(n, ignoreCase = true) }
+        }
+
+        if (cleanBlocks.isEmpty()) return ""
+
+        // Skip short user prompt right above longer AI answer
+        var startIdx = 0
+        for (i in cleanBlocks.indices) {
+            val hasLongBelow = (i + 1 until cleanBlocks.size).any { j -> cleanBlocks[j].length > 50 }
+            if (cleanBlocks[i].length in 8..200 && hasLongBelow && i < cleanBlocks.size - 1) {
+                startIdx = i + 1
+            }
+        }
+
+        return cleanBlocks.subList(startIdx, cleanBlocks.size)
+            .joinToString(". ")
+            .replace(Regex("[*#`_~•]"), " ")
+            .replace(Regex("\\s+"), " ")
+            .trim()
     }
 
-    private fun walkTree(node: AccessibilityNodeInfo?, bag: LinkedHashSet<String>) {
-        if (node == null) return
+    private fun collectVisibleNodes(node: AccessibilityNodeInfo?, list: MutableList<String>) {
+        if (node == null || !node.isVisibleToUser) return
         val t = node.text?.toString()?.trim()
         val d = node.contentDescription?.toString()?.trim()
-        val h = node.hintText?.toString()?.trim()
 
-        if (!t.isNullOrBlank() && t.length > 2) bag.add(t)
-        if (!d.isNullOrBlank() && d.length > 8 && d != h) bag.add(d)
+        if (!t.isNullOrBlank() && t.length > 3) list.add(t)
+        if (!d.isNullOrBlank() && d.length > 15) list.add(d)
 
         for (i in 0 until node.childCount) {
-            walkTree(node.getChild(i), bag)
-        }
-    }
-
-    private fun smartAnalyzeScreen(instruction: String) {
-        rawScreenDump = captureDeepScreenText()
-        if (rawScreenDump.isBlank()) {
-            Toast.makeText(this, "திரையில் தகவல் இல்லை; 🎙️ பேசு தட்டி கேளுங்கள்", Toast.LENGTH_SHORT).show()
-            floatingOrb.alpha = 0.22f
-            return
-        }
-
-        val prefs = getSharedPreferences("TamilReaderPrefs", Context.MODE_PRIVATE)
-        val apiKey = prefs.getString("groq_api_key", "") ?: ""
-
-        if (apiKey.isBlank()) {
-            // Fallback clean bilingual reader if API key is not entered yet
-            val clean = rawScreenDump.replace(Regex("[*#`_~•]"), " ").replace(Regex("\\s+"), " ")
-            startSpeakingText(clean)
-            return
-        }
-
-        controlPanel.visibility = View.VISIBLE
-        updateOrbColor("#9C27B0") // Purple = AI Thinking
-
-        thread {
-            try {
-                val url = URL("https://api.groq.com/openai/v1/chat/completions")
-                val conn = (url.openConnection() as HttpURLConnection).apply {
-                    requestMethod = "POST"
-                    setRequestProperty("Authorization", "Bearer $apiKey")
-                    setRequestProperty("Content-Type", "application/json")
-                    doOutput = true
-                }
-
-                val systemPrompt = """
-                    You are a warm, intelligent bilingual AI voice companion (like Gemini Live) speaking Tamil and English naturally.
-                    Analyze the raw screen text from the user's phone (which may be from ChatGPT, Gemini, Chrome, or a PDF).
-                    Ignore UI noise (buttons, timestamps, ads, 'Ask Gemini', 'Message ChatGPT', and the user's own prompt).
-                    Focus ONLY on the actual AI answer or main article content.
-                    Speak like a helpful human friend—never sound like a robotic screen reader.
-                    If the user asks in English, reply in natural English. If in Tamil/Tanglish, reply in natural conversational Tamil/Tanglish.
-                    Keep responses concise, clear, and free of markdown symbols (*, #, bullets).
-                """.trimIndent()
-
-                val userMsg = "Screen Content:\n${rawScreenDump.take(5000)}\n\nTask: $instruction"
-
-                val body = JSONObject().apply {
-                    put("model", "llama-3.3-70b-versatile")
-                    put("temperature", 0.5)
-                    put("messages", JSONArray().apply {
-                        put(JSONObject().apply { put("role", "system"); put("content", systemPrompt) })
-                        put(JSONObject().apply { put("role", "user"); put("content", userMsg) })
-                    })
-                }
-
-                OutputStreamWriter(conn.outputStream).use { it.write(body.toString()) }
-                val response = conn.inputStream.bufferedReader().readText()
-                val aiReply = JSONObject(response)
-                    .getJSONArray("choices")
-                    .getJSONObject(0)
-                    .getJSONObject("message")
-                    .getString("content")
-                    .replace(Regex("[*#`_~•]"), " ")
-                    .trim()
-
-                mainHandler.post {
-                    startSpeakingText(aiReply)
-                }
-            } catch (e: Exception) {
-                mainHandler.post {
-                    Toast.makeText(this, "AI இணைப்பு பிழை: Groq Key / Internet சரிபார்க்கவும்", Toast.LENGTH_SHORT).show()
-                    updateOrbColor("#6200EE")
-                }
-            }
+            collectVisibleNodes(node.getChild(i), list)
         }
     }
 
@@ -325,6 +279,7 @@ class VoiceReaderService : AccessibilityService(), TextToSpeech.OnInitListener {
 
         currentIndex = 0
         isPaused = false
+        manualStopOrJump = false
         btnPlayPause.text = "⏸️"
         controlPanel.visibility = View.VISIBLE
         floatingOrb.alpha = 1.0f
@@ -336,30 +291,24 @@ class VoiceReaderService : AccessibilityService(), TextToSpeech.OnInitListener {
         if (currentIndex !in sentencesList.indices) return
         val sentence = sentencesList[currentIndex]
 
-        // Auto-detect Tamil vs English script for natural pronunciation
         val hasTamil = sentence.any { it in '\u0B80'..'\u0BFF' }
-        if (hasTamil) {
-            tts?.setLanguage(Locale("ta", "IN"))
-        } else {
-            tts?.setLanguage(Locale("en", "IN"))
-        }
-
+        tts?.setLanguage(if (hasTamil) Locale("ta", "IN") else Locale("en", "IN"))
         tts?.setSpeechRate(speechRate)
+
         val params = Bundle()
         tts?.speak(sentence, TextToSpeech.QUEUE_FLUSH, params, "S_$currentIndex")
     }
 
     private fun cycleSpeed() {
         speechRate = when (speechRate) {
-            1.05f -> 1.3f
-            1.3f -> 1.6f
-            1.6f -> 2.0f
-            else -> 1.05f
+            1.0f -> 1.25f
+            1.25f -> 1.5f
+            1.5f -> 2.0f
+            else -> 1.0f
         }
-        val label = if (speechRate == 1.05f) "1.0x" else "${speechRate}x"
-        btnSpeed.text = label
+        btnSpeed.text = "${speechRate}x"
         if (!isPaused && sentencesList.isNotEmpty()) {
-            isRestartingUtterance = true
+            manualStopOrJump = true
             tts?.stop()
             speakCurrentSentence()
         }
@@ -367,7 +316,7 @@ class VoiceReaderService : AccessibilityService(), TextToSpeech.OnInitListener {
 
     private fun jumpSentence(delta: Int) {
         if (sentencesList.isEmpty()) return
-        isRestartingUtterance = true
+        manualStopOrJump = true
         tts?.stop()
         currentIndex = (currentIndex + delta).coerceIn(0, sentencesList.size - 1)
         isPaused = false
@@ -384,7 +333,7 @@ class VoiceReaderService : AccessibilityService(), TextToSpeech.OnInitListener {
             speakCurrentSentence()
         } else {
             isPaused = true
-            isRestartingUtterance = true
+            manualStopOrJump = true
             tts?.stop()
             btnPlayPause.text = "▶️"
             updateOrbColor("#FF9800")
@@ -396,13 +345,13 @@ class VoiceReaderService : AccessibilityService(), TextToSpeech.OnInitListener {
         val scrollable = findScrollable(rootNode)
         if (scrollable != null && scrollable.performAction(AccessibilityNodeInfo.ACTION_SCROLL_FORWARD)) {
             mainHandler.postDelayed({
-                val nextDump = captureDeepScreenText()
-                if (nextDump.isNotBlank() && nextDump != rawScreenDump) {
-                    smartAnalyzeScreen("ஸ்க்ரோல் செய்த பிறகு திரையில் புதிதாகத் தெரியும் மீதிப் பதிலை மட்டும் தொடர்ந்து இயல்பாகச் சொல்.")
+                val moreText = extractCleanScreenText()
+                if (moreText.isNotBlank() && !sentencesList.contains(moreText.take(40))) {
+                    startSpeakingText(moreText)
                 } else {
                     stopAndHide()
                 }
-            }, 900)
+            }, 850)
         } else {
             stopAndHide()
         }
@@ -419,7 +368,7 @@ class VoiceReaderService : AccessibilityService(), TextToSpeech.OnInitListener {
     }
 
     private fun startLiveVoiceChat() {
-        isRestartingUtterance = true
+        manualStopOrJump = true
         tts?.stop()
         isPaused = true
         btnPlayPause.text = "▶️"
@@ -431,26 +380,26 @@ class VoiceReaderService : AccessibilityService(), TextToSpeech.OnInitListener {
         speechRecognizer = SpeechRecognizer.createSpeechRecognizer(this)
         val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
             putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-            // Supports both Tamil and Indian English voice input seamlessly
             putExtra(RecognizerIntent.EXTRA_LANGUAGE, "ta-IN")
-            putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, "ta-IN")
             putExtra("android.speech.extra.EXTRA_ADDITIONAL_LANGUAGES", arrayOf("en-IN", "en-US"))
         }
 
         speechRecognizer?.setRecognitionListener(object : RecognitionListener {
             override fun onReadyForSpeech(params: Bundle?) {
-                Toast.makeText(this@VoiceReaderService, "🎙️ தமிழ் அல்லது English-ல் கேளுங்கள்...", Toast.LENGTH_SHORT).show()
+                Toast.makeText(this@VoiceReaderService, "🎙️ கேளுங்கள்...", Toast.LENGTH_SHORT).show()
             }
             override fun onResults(results: Bundle?) {
                 val query = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull() ?: ""
                 if (query.isNotBlank()) {
                     Toast.makeText(this@VoiceReaderService, "நீங்கள்: $query", Toast.LENGTH_SHORT).show()
-                    smartAnalyzeScreen("பயனர் குரலில் கேட்ட கேள்வி: '$query'. திரையில் உள்ள தகவலை வைத்து இதற்கு மிக இயல்பாகவும் சுருக்கமாகவும் நண்பன் போலப் பதில் சொல்.")
+                    askGroqAI("பயனர் கேள்வி: '$query'. திரையில் உள்ள தகவலை வைத்து 2-3 வரிகளில் இயல்பாகப் பதில் சொல்.")
+                } else {
+                    updateOrbColor("#6200EE")
                 }
             }
             override fun onError(error: Int) {
                 updateOrbColor("#6200EE")
-                Toast.makeText(this@VoiceReaderService, "மைக் அனுமதி ஆன் உள்ளதா எனச் சரிபார்க்கவும்", Toast.LENGTH_SHORT).show()
+                Toast.makeText(this@VoiceReaderService, "மைக் பிழை ($error) - மீண்டும் தட்டவும்", Toast.LENGTH_SHORT).show()
             }
             override fun onBeginningOfSpeech() {}
             override fun onRmsChanged(rmsdB: Float) {}
@@ -462,13 +411,86 @@ class VoiceReaderService : AccessibilityService(), TextToSpeech.OnInitListener {
         speechRecognizer?.startListening(intent)
     }
 
+    private fun askGroqAI(instruction: String) {
+        val screenContent = extractCleanScreenText()
+        val prefs = getSharedPreferences("TamilReaderPrefs", Context.MODE_PRIVATE)
+        val apiKey = prefs.getString("groq_api_key", "") ?: ""
+
+        if (apiKey.isBlank()) {
+            Toast.makeText(this, "Groq API Key இல்லை — ஆஃப்லைன் சுருக்கம் வாசிக்கிறது", Toast.LENGTH_SHORT).show()
+            val shortFallback = screenContent.split(Regex("(?<=[.!?])\\s+")).take(3).joinToString(". ")
+            if (shortFallback.isNotBlank()) startSpeakingText(shortFallback)
+            return
+        }
+
+        manualStopOrJump = true
+        tts?.stop()
+        updateOrbColor("#9C27B0")
+        Toast.makeText(this, "AI யோசிக்கிறது...", Toast.LENGTH_SHORT).show()
+
+        thread {
+            try {
+                val url = URL("https://api.groq.com/openai/v1/chat/completions")
+                val conn = (url.openConnection() as HttpURLConnection).apply {
+                    requestMethod = "POST"
+                    setRequestProperty("Authorization", "Bearer $apiKey")
+                    setRequestProperty("Content-Type", "application/json")
+                    setRequestProperty("User-Agent", "Mozilla/5.0")
+                    connectTimeout = 10000
+                    readTimeout = 10000
+                    doOutput = true
+                }
+
+                val systemPrompt = "நீ ஒரு நட்பான தமிழ்-ஆங்கில AI உதவியாளர். திரையில் உள்ள தகவலைப் பார்த்து, கேட்கப்பட்டதற்கு 2-3 சிறிய வாக்கியங்களில் இயல்பான பேச்சுத் தமிழில் பதில் சொல். Markdown குறியீடுகள் (*, #) பயன்படுத்தாதே."
+                val userMsg = "திரை தகவல்:\n${screenContent.take(3500)}\n\nகட்டளை: $instruction"
+
+                val body = JSONObject().apply {
+                    put("model", "llama-3.3-70b-versatile")
+                    put("messages", JSONArray().apply {
+                        put(JSONObject().apply { put("role", "system"); put("content", systemPrompt) })
+                        put(JSONObject().apply { put("role", "user"); put("content", userMsg) })
+                    })
+                }
+
+                OutputStreamWriter(conn.outputStream).use { it.write(body.toString()) }
+
+                val code = conn.responseCode
+                if (code !in 200..299) {
+                    val errText = conn.errorStream?.bufferedReader()?.readText() ?: "HTTP $code"
+                    throw Exception("API Error $code: ${errText.take(80)}")
+                }
+
+                val res = conn.inputStream.bufferedReader().readText()
+                val reply = JSONObject(res)
+                    .getJSONArray("choices")
+                    .getJSONObject(0)
+                    .getJSONObject("message")
+                    .getString("content")
+                    .replace(Regex("[*#`_~•]"), " ")
+                    .trim()
+
+                mainHandler.post {
+                    startSpeakingText(reply)
+                }
+            } catch (e: Exception) {
+                mainHandler.post {
+                    Toast.makeText(this, "AI பிழை: ${e.message}", Toast.LENGTH_LONG).show()
+                    updateOrbColor("#6200EE")
+                    // Fallback to reading screen directly so it never stays silent
+                    if (screenContent.isNotBlank()) startSpeakingText(screenContent)
+                }
+            }
+        }
+    }
+
     private fun stopAndHide() {
-        isRestartingUtterance = true
+        manualStopOrJump = true
         tts?.stop()
         isPaused = false
         currentIndex = 0
+        sentencesList.clear()
         controlPanel.visibility = View.GONE
-        floatingOrb.alpha = 0.22f
+        floatingOrb.alpha = 0.15f
         updateOrbColor("#6200EE")
     }
 
