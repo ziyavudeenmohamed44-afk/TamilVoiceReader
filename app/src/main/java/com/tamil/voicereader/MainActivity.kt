@@ -1,7 +1,9 @@
 package com.tamil.voicereader
 
+import android.Manifest
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Bundle
 import android.provider.Settings
@@ -11,6 +13,8 @@ import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.app.ActivityCompat
+import androidx.core.content.ContextCompat
 
 class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -20,17 +24,28 @@ class MainActivity : AppCompatActivity() {
 
         val layout = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(60, 80, 60, 60)
+            setPadding(56, 70, 56, 56)
         }
 
         val title = TextView(this).apply {
-            text = "Tamil AI Voice Companion v3.0\n\n1. கீழே உள்ள அனுமதிகளை ஆன் செய்யவும்:"
-            textSize = 18f
-            setPadding(0, 0, 0, 30)
+            text = "Smart AI Companion v5.0\n(Tamil + English Live Assistant)"
+            textSize = 19f
+            setPadding(0, 0, 0, 28)
+        }
+
+        val btnMic = Button(this).apply {
+            text = "1. Allow Microphone (குரல் உரையாடலுக்கு)"
+            setOnClickListener {
+                if (ContextCompat.checkSelfPermission(this@MainActivity, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+                    ActivityCompat.requestPermissions(this@MainActivity, arrayOf(Manifest.permission.RECORD_AUDIO), 101)
+                } else {
+                    Toast.makeText(this@MainActivity, "Microphone ஏற்கனவே ஆன் செய்யப்பட்டுள்ளது!", Toast.LENGTH_SHORT).show()
+                }
+            }
         }
 
         val btnOverlay = Button(this).apply {
-            text = "1. Enable Floating Button (Overlay)"
+            text = "2. Enable Floating Orb (Overlay)"
             setOnClickListener {
                 if (!Settings.canDrawOverlays(this@MainActivity)) {
                     startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
@@ -41,16 +56,16 @@ class MainActivity : AppCompatActivity() {
         }
 
         val btnAccessibility = Button(this).apply {
-            text = "2. Enable Screen Reader (Accessibility)"
+            text = "3. Enable Screen Vision (Accessibility)"
             setOnClickListener {
                 startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
             }
         }
 
         val aiLabel = TextView(this).apply {
-            text = "\n2. இலவச AI சுருக்கம் (Free Groq API Key):\n(console.groq.com-ல் இலவசமாக எடுத்து கீழே பேஸ்ட் செய்யவும்)"
+            text = "\nFree AI Brain Key (Groq API Key):\n(இதைப் போட்டால் தான் உண்மையான AI போலப் பேசும்)"
             textSize = 14f
-            setPadding(0, 40, 0, 15)
+            setPadding(0, 32, 0, 12)
         }
 
         val etApiKey = EditText(this).apply {
@@ -59,7 +74,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         val btnSaveKey = Button(this).apply {
-            text = "Save Free AI Key"
+            text = "Save AI Key"
             setOnClickListener {
                 prefs.edit().putString("groq_api_key", etApiKey.text.toString().trim()).apply()
                 Toast.makeText(this@MainActivity, "AI Key சேமிக்கப்பட்டது!", Toast.LENGTH_SHORT).show()
@@ -67,6 +82,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         layout.addView(title)
+        layout.addView(btnMic)
         layout.addView(btnOverlay)
         layout.addView(btnAccessibility)
         layout.addView(aiLabel)
