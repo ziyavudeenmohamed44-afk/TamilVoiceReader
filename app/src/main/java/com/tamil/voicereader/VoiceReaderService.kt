@@ -1,11 +1,14 @@
 package com.tamil.voicereader
 
 import android.accessibilityservice.AccessibilityService
+import android.content.Context
 import android.content.Intent
 import android.graphics.Color
 import android.graphics.PixelFormat
 import android.graphics.drawable.GradientDrawable
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
@@ -21,26 +24,35 @@ import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
+import org.json.JSONArray
+import org.json.JSONObject
+import java.io.OutputStreamWriter
+import java.net.HttpURLConnection
+import java.net.URL
 import java.util.Locale
+import kotlin.concurrent.thread
 
 class VoiceReaderService : AccessibilityService(), TextToSpeech.OnInitListener {
 
     private lateinit var windowManager: WindowManager
     private lateinit var rootContainer: LinearLayout
     private lateinit var floatingOrb: ImageView
-    private lateinit var controlBar: LinearLayout
+    private lateinit var controlPanel: LinearLayout
     private lateinit var btnPlayPause: TextView
     private lateinit var btnSpeed: TextView
     private lateinit var btnSimplify: TextView
 
     private var tts: TextToSpeech? = null
     private var speechRecognizer: SpeechRecognizer? = null
+    private val mainHandler = Handler(Looper.getMainLooper())
 
-    private var sentencesList: List<String> = emptyList()
-    private var fullExtractedText: String = ""
-    private var currentSentenceIndex = 0
+    private var sentencesList = mutableListOf<String>()
+    private var readHistorySet = mutableSetOf<String>()
+    private var fullCapturedText = ""
+    private var currentIndex = 0
     private var isPaused = false
     private var isSimplifiedMode = false
+    private var autoScrollEnabled = true
     private var speechRate = 1.0f
 
     override fun onServiceConnected() {
@@ -56,11 +68,13 @@ class VoiceReaderService : AccessibilityService(), TextToSpeech.OnInitListener {
                 override fun onStart(utteranceId: String?) {}
                 override fun onDone(utteranceId: String?) {
                     if (!isPaused) {
-                        currentSentenceIndex++
-                        if (currentSentenceIndex < sentencesList.size) {
+                        currentIndex++
+                        if (currentIndex < sentencesList.size) {
                             speakCurrentSentence()
+                        } else if (autoScrollEnabled && !isSimplifiedMode) {
+                            mainHandler.post { tryAutoScrollAndContinue() }
                         } else {
-                            rootContainer.post { resetUIState() }
+                            mainHandler.post { resetUIState() }
                         }
                     }
                 }
@@ -73,52 +87,72 @@ class VoiceReaderService : AccessibilityService(), TextToSpeech.OnInitListener {
         windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
 
         rootContainer = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.START
         }
 
         floatingOrb = ImageView(this).apply {
             setImageResource(android.R.drawable.ic_btn_speak_now)
             setColorFilter(Color.WHITE)
-            setPadding(32, 32, 32, 32)
+            setPadding(30, 30, 30, 30)
             background = GradientDrawable().apply {
                 shape = GradientDrawable.OVAL
                 setColor(Color.parseColor("#6200EE"))
             }
         }
 
-        controlBar = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
+        controlPanel = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
             visibility = View.GONE
-            setPadding(20, 12, 20, 12)
+            setPadding(18, 14, 18, 14)
             background = GradientDrawable().apply {
-                cornerRadius = 50f
-                setColor(Color.parseColor("#E61E1E2E"))
+                cornerRadius = 36f
+                setColor(Color.parseColor("#F0181824"))
             }
         }
 
-        btnPlayPause = createControlButton("⏸️") { togglePauseResume() }
-        val btnReplay = createControlButton("🔄") { replayFromStart() }
-        btnSpeed = createControlButton("1.0x") { cycleSpeed() }
-        btnSimplify = createControlButton("✨சுருக்கம்") { toggleSimplifyMode() }
-        val btnVoiceCmd = createControlButton("🎙️") { startVoiceCommand() }
-        val btnStop = createControlButton("❌") { stopEverything() }
+        // Row 1: Navigation & Seek Controls
+        val row1 = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+        }
+        val btnPrev = createBtn("⏮️") { jumpParagraph(-1) }
+        val btnBack5s = createBtn("-5s") { seekSeconds(-5) }
+        btnPlayPause = createBtn("⏸️") { togglePauseResume() }
+        val btnFwd5s = createBtn("+5s") { seekSeconds(5) }
+        val btnNext = createBtn("⏭️") { jumpParagraph(1) }
 
-        controlBar.addView(btnPlayPause)
-        controlBar.addView(btnReplay)
-        controlBar.addView(btnSpeed)
-        controlBar.addView(btnSimplify)
-        controlBar.addView(btnVoiceCmd)
-        controlBar.addView(btnStop)
+        row1.addView(btnPrev)
+        row1.addView(btnBack5s)
+        row1.addView(btnPlayPause)
+        row1.addView(btnFwd5s)
+        row1.addView(btnNext)
 
-        val orbParams = LinearLayout.LayoutParams(140, 140)
-        val barParams = LinearLayout.LayoutParams(
+        // Row 2: Speed, AI Simplify, Voice & Close
+        val row2 = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+            setPadding(0, 8, 0, 0)
+        }
+        btnSpeed = createBtn("1.0x") { cycleSpeed() }
+        btnSimplify = createBtn("✨AI சுருக்கம்") { triggerAISimplify() }
+        val btnVoice = createBtn("🎙️") { startVoiceCommand() }
+        val btnClose = createBtn("❌") { stopEverything() }
+
+        row2.addView(btnSpeed)
+        row2.addView(btnSimplify)
+        row2.addView(btnVoice)
+        row2.addView(btnClose)
+
+        controlPanel.addView(row1)
+        controlPanel.addView(row2)
+
+        rootContainer.addView(floatingOrb, LinearLayout.LayoutParams(135, 135))
+        val panelParams = LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.WRAP_CONTENT,
             LinearLayout.LayoutParams.WRAP_CONTENT
-        ).apply { setMargins(16, 0, 0, 0) }
-
-        rootContainer.addView(floatingOrb, orbParams)
-        rootContainer.addView(controlBar, barParams)
+        ).apply { setMargins(0, 12, 0, 0) }
+        rootContainer.addView(controlPanel, panelParams)
 
         val windowParams = WindowManager.LayoutParams(
             WindowManager.LayoutParams.WRAP_CONTENT,
@@ -128,8 +162,8 @@ class VoiceReaderService : AccessibilityService(), TextToSpeech.OnInitListener {
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP or Gravity.START
-            x = 30
-            y = 350
+            x = 24
+            y = 300
         }
 
         var initialX = 0
@@ -165,98 +199,173 @@ class VoiceReaderService : AccessibilityService(), TextToSpeech.OnInitListener {
         windowManager.addView(rootContainer, windowParams)
     }
 
-    private fun createControlButton(label: String, onClick: () -> Unit): TextView {
+    private fun createBtn(label: String, onClick: () -> Unit): TextView {
         return TextView(this).apply {
             text = label
             textSize = 13f
             setTextColor(Color.WHITE)
-            setPadding(18, 12, 18, 12)
+            setPadding(18, 10, 18, 10)
             setOnClickListener { onClick() }
         }
     }
 
     private fun onOrbClicked() {
         if (tts?.isSpeaking == true || isPaused) {
-            controlBar.visibility = if (controlBar.visibility == View.VISIBLE) View.GONE else View.VISIBLE
+            controlPanel.visibility = if (controlPanel.visibility == View.VISIBLE) View.GONE else View.VISIBLE
             return
         }
-        extractAndStartReading()
+        startFreshReading()
     }
 
-    private fun extractAndStartReading() {
+    private fun startFreshReading() {
         val rootNode = rootInActiveWindow ?: return
-        val pkg = rootNode.packageName?.toString() ?: ""
+        readHistorySet.clear()
+        sentencesList.clear()
+        fullCapturedText = ""
+        isSimplifiedMode = false
+        btnSimplify.text = "✨AI சுருக்கம்"
 
-        val rawBlocks = mutableListOf<String>()
-        collectCleanBlocks(rootNode, rawBlocks)
+        val blocks = extractScreenBlocks(rootNode)
+        if (blocks.isEmpty()) {
+            Toast.makeText(this, "திரையில் வாசிக்க உரை இல்லை", Toast.LENGTH_SHORT).show()
+            return
+        }
 
-        // Filter out system/app chrome strings
-        val ignoredPhrases = listOf(
+        val cleanedText = filterAndJoinBlocks(blocks)
+        fullCapturedText = cleanedText
+        appendSentences(cleanedText)
+
+        if (sentencesList.isNotEmpty()) {
+            currentIndex = 0
+            isPaused = false
+            btnPlayPause.text = "⏸️"
+            controlPanel.visibility = View.VISIBLE
+            updateOrbColor("#E91E63")
+            speakCurrentSentence()
+        }
+    }
+
+    private fun extractScreenBlocks(root: AccessibilityNodeInfo): List<String> {
+        val raw = mutableListOf<String>()
+        traverseNode(root, raw)
+        return raw.distinct()
+    }
+
+    private fun traverseNode(node: AccessibilityNodeInfo?, list: MutableList<String>) {
+        if (node == null || !node.isVisibleToUser) return
+
+        // Capture both text (Gemini/Native) and contentDescription (ChatGPT/Chrome/WebView/PDF)
+        val txt = node.text?.toString()?.trim()
+        val desc = node.contentDescription?.toString()?.trim()
+
+        if (!txt.isNullOrBlank() && txt.length > 12) {
+            list.add(txt)
+        } else if (!desc.isNullOrBlank() && desc.length > 20) {
+            list.add(desc)
+        }
+
+        for (i in 0 until node.childCount) {
+            traverseNode(node.getChild(i), list)
+        }
+    }
+
+    private fun filterAndJoinBlocks(blocks: List<String>): String {
+        val noise = listOf(
             "Ask Gemini", "Message ChatGPT", "Reply to Claude", "Gemini is AI",
-            "ChatGPT can make mistakes", "Claude can make mistakes", "New chat",
-            "Gemini Flash", "Gemini Pro", "GPT-4", "Sonnet"
+            "ChatGPT can make mistakes", "Sponsored", "Trip.com", "Install",
+            "Learn more", "Sign in", "New chat", "Search or type URL"
         )
 
-        val contentBlocks = rawBlocks.filter { block ->
-            block.length > 15 && ignoredPhrases.none { ignore -> block.contains(ignore, ignoreCase = true) }
+        val validBlocks = blocks.filter { b ->
+            noise.none { n -> b.contains(n, ignoreCase = true) }
         }
 
-        if (contentBlocks.isEmpty()) {
-            Toast.makeText(this, "வாசிப்பதற்கு பதில் எதுவும் கிடைக்கவில்லை", Toast.LENGTH_SHORT).show()
-            return
-        }
-
-        // Smart extraction: Skip the user's short prompt and capture the entire AI response block(s)
-        val aiResponse = buildLatestResponse(contentBlocks, pkg)
-        fullExtractedText = aiResponse
-            .replace(Regex("[*#`_~•]"), "")
-            .replace(Regex("\\s+"), " ")
-            .trim()
-
-        isSimplifiedMode = false
-        btnSimplify.text = "✨சுருக்கம்"
-        prepareAndSpeak(fullExtractedText)
-    }
-
-    private fun buildLatestResponse(blocks: List<String>, pkg: String): String {
-        // Find the last short block (likely the user's question) and take everything AFTER it
-        var lastPromptIndex = -1
-        for (i in blocks.indices.reversed()) {
-            // Usually user prompts are shorter than 180 chars and followed by longer AI paragraphs
-            if (blocks[i].length < 180 && i < blocks.size - 1 && blocks[i + 1].length > 80) {
-                lastPromptIndex = i
+        // Skip short user question at the top if followed by long AI/article paragraphs
+        var startIdx = 0
+        for (i in validBlocks.indices.reversed()) {
+            if (validBlocks[i].length < 150 && i < validBlocks.size - 1 && validBlocks[i + 1].length > 90) {
+                startIdx = i + 1
                 break
             }
         }
 
-        val responseBlocks = if (lastPromptIndex != -1) {
-            blocks.subList(lastPromptIndex + 1, blocks.size)
-        } else {
-            // If only answer is visible on screen (e.g., scrolled down in ChatGPT), take all visible content blocks
-            blocks
-        }
-
-        return responseBlocks.joinToString(". ")
+        val selected = validBlocks.subList(startIdx, validBlocks.size)
+        return selected.joinToString(". ")
+            .replace(Regex("[*#`_~•]"), "")
+            .replace(Regex("\\s+"), " ")
+            .trim()
     }
 
-    private fun prepareAndSpeak(text: String) {
-        sentencesList = text.split(Regex("(?<=[.!?।\\n])\\s+")).filter { it.isNotBlank() }
-        if (sentencesList.isEmpty()) return
+    private fun appendSentences(text: String) {
+        val newSentences = text.split(Regex("(?<=[.!?।\\n])\\s+")).filter { it.length > 3 }
+        for (s in newSentences) {
+            if (readHistorySet.add(s)) {
+                sentencesList.add(s)
+            }
+        }
+    }
 
-        currentSentenceIndex = 0
+    private fun tryAutoScrollAndContinue() {
+        val rootNode = rootInActiveWindow ?: run {
+            resetUIState()
+            return
+        }
+        val scrollable = findScrollableNode(rootNode)
+        if (scrollable != null && scrollable.performAction(AccessibilityNodeInfo.ACTION_SCROLL_FORWARD)) {
+            mainHandler.postDelayed({
+                val updatedRoot = rootInActiveWindow
+                if (updatedRoot != null) {
+                    val newBlocks = extractScreenBlocks(updatedRoot)
+                    val newText = filterAndJoinBlocks(newBlocks)
+                    val prevCount = sentencesList.size
+                    fullCapturedText += " " + newText
+                    appendSentences(newText)
+                    if (sentencesList.size > prevCount) {
+                        speakCurrentSentence()
+                    } else {
+                        resetUIState()
+                    }
+                } else {
+                    resetUIState()
+                }
+            }, 900)
+        } else {
+            resetUIState()
+        }
+    }
+
+    private fun findScrollableNode(node: AccessibilityNodeInfo?): AccessibilityNodeInfo? {
+        if (node == null) return null
+        if (node.isScrollable) return node
+        for (i in 0 until node.childCount) {
+            val found = findScrollableNode(node.getChild(i))
+            if (found != null) return found
+        }
+        return null
+    }
+
+    private fun speakCurrentSentence() {
+        if (currentIndex in sentencesList.indices) {
+            tts?.setSpeechRate(speechRate)
+            val params = Bundle()
+            tts?.speak(sentencesList[currentIndex], TextToSpeech.QUEUE_FLUSH, params, "UTT_$currentIndex")
+        }
+    }
+
+    private fun jumpParagraph(delta: Int) {
+        if (sentencesList.isEmpty()) return
+        tts?.stop()
+        currentIndex = (currentIndex + delta).coerceIn(0, sentencesList.size - 1)
         isPaused = false
         btnPlayPause.text = "⏸️"
-        controlBar.visibility = View.VISIBLE
         updateOrbColor("#E91E63")
         speakCurrentSentence()
     }
 
-    private fun speakCurrentSentence() {
-        if (currentSentenceIndex in sentencesList.indices) {
-            tts?.setSpeechRate(speechRate)
-            val params = Bundle()
-            tts?.speak(sentencesList[currentSentenceIndex], TextToSpeech.QUEUE_FLUSH, params, "SENTENCE_$currentSentenceIndex")
-        }
+    private fun seekSeconds(seconds: Int) {
+        // Approximate 1 sentence ≈ 4-5 seconds
+        val sentenceStep = if (seconds > 0) 1 else -1
+        jumpParagraph(sentenceStep)
     }
 
     private fun togglePauseResume() {
@@ -273,15 +382,6 @@ class VoiceReaderService : AccessibilityService(), TextToSpeech.OnInitListener {
         }
     }
 
-    private fun replayFromStart() {
-        tts?.stop()
-        currentSentenceIndex = 0
-        isPaused = false
-        btnPlayPause.text = "⏸️"
-        updateOrbColor("#E91E63")
-        speakCurrentSentence()
-    }
-
     private fun cycleSpeed() {
         speechRate = when (speechRate) {
             1.0f -> 1.25f
@@ -296,61 +396,111 @@ class VoiceReaderService : AccessibilityService(), TextToSpeech.OnInitListener {
         }
     }
 
-    private fun toggleSimplifyMode() {
-        isSimplifiedMode = !isSimplifiedMode
-        tts?.stop()
+    private fun triggerAISimplify() {
         if (isSimplifiedMode) {
+            isSimplifiedMode = false
+            btnSimplify.text = "✨AI சுருக்கம்"
+            sentencesList.clear()
+            readHistorySet.clear()
+            appendSentences(fullCapturedText)
+            currentIndex = 0
+            speakCurrentSentence()
+            return
+        }
+
+        val prefs = getSharedPreferences("TamilReaderPrefs", Context.MODE_PRIVATE)
+        val apiKey = prefs.getString("groq_api_key", "") ?: ""
+
+        tts?.stop()
+        Toast.makeText(this, "AI சுருக்கமாகத் தயாரிக்கிறது...", Toast.LENGTH_SHORT).show()
+
+        if (apiKey.isBlank()) {
+            // Fallback smart local summary if no free Groq key is added yet
+            isSimplifiedMode = true
             btnSimplify.text = "📄முழுமை"
-            // Extractive summarization: pick first sentence, key numbered/bullet lines, and conclusion
-            val allSentences = fullExtractedText.split(Regex("(?<=[.!?])\\s+")).filter { it.length > 20 }
-            val summary = if (allSentences.size <= 4) {
-                fullExtractedText
-            } else {
-                val picked = mutableListOf<String>()
-                picked.add(allSentences.first())
-                allSentences.drop(1).dropLast(1).forEachIndexed { idx, s ->
-                    if (idx % 3 == 0 && picked.size < 5) picked.add(s)
+            val shortList = sentencesList.filterIndexed { idx, _ -> idx == 0 || idx % 3 == 0 }.take(5)
+            sentencesList = shortList.toMutableList()
+            currentIndex = 0
+            speakCurrentSentence()
+            return
+        }
+
+        thread {
+            try {
+                val url = URL("https://api.groq.com/openai/v1/chat/completions")
+                val conn = (url.openConnection() as HttpURLConnection).apply {
+                    requestMethod = "POST"
+                    setRequestProperty("Authorization", "Bearer $apiKey")
+                    setRequestProperty("Content-Type", "application/json")
+                    doOutput = true
                 }
-                picked.add(allSentences.last())
-                "சுருக்கமாக: " + picked.joinToString(". ")
+
+                val prompt = "கீழே உள்ள தகவலை ஒரு நண்பன் பக்கத்தில் இருந்து எளிமையாகவும் இயல்பாகவும் தமிழில் புரிய வைப்பது போல 4 அல்லது 5 சிறிய வாக்கியங்களில் சுருக்கிச் சொல் (Markdown குறியீடுகள் இல்லாமல்):\n\n${fullCapturedText.take(3500)}"
+
+                val body = JSONObject().apply {
+                    put("model", "llama-3.3-70b-versatile")
+                    put("messages", JSONArray().apply {
+                        put(JSONObject().apply {
+                            put("role", "user")
+                            put("content", prompt)
+                        })
+                    })
+                }
+
+                OutputStreamWriter(conn.outputStream).use { it.write(body.toString()) }
+
+                val responseStr = conn.inputStream.bufferedReader().readText()
+                val aiReply = JSONObject(responseStr)
+                    .getJSONArray("choices")
+                    .getJSONObject(0)
+                    .getJSONObject("message")
+                    .getString("content")
+                    .replace(Regex("[*#`_~]"), "")
+                    .trim()
+
+                mainHandler.post {
+                    isSimplifiedMode = true
+                    btnSimplify.text = "📄முழுமை"
+                    sentencesList.clear()
+                    readHistorySet.clear()
+                    appendSentences(aiReply)
+                    currentIndex = 0
+                    isPaused = false
+                    btnPlayPause.text = "⏸️"
+                    speakCurrentSentence()
+                }
+            } catch (e: Exception) {
+                mainHandler.post {
+                    Toast.makeText(this, "AI பிழை: Key சரிபார்க்கவும்", Toast.LENGTH_SHORT).show()
+                }
             }
-            prepareAndSpeak(summary)
-        } else {
-            btnSimplify.text = "✨சுருக்கம்"
-            prepareAndSpeak(fullExtractedText)
         }
     }
 
     private fun startVoiceCommand() {
-        // Pause current reading while listening to user's voice command
-        if (tts?.isSpeaking == true) {
-            togglePauseResume()
-        }
-
-        if (!SpeechRecognizer.isRecognitionAvailable(this)) {
-            Toast.makeText(this, "Voice recognition கிடைக்கவில்லை", Toast.LENGTH_SHORT).show()
-            return
-        }
-
+        if (tts?.isSpeaking == true) togglePauseResume()
         speechRecognizer?.destroy()
         speechRecognizer = SpeechRecognizer.createSpeechRecognizer(this)
         val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
             putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
             putExtra(RecognizerIntent.EXTRA_LANGUAGE, "ta-IN")
         }
-
         speechRecognizer?.setRecognitionListener(object : RecognitionListener {
             override fun onReadyForSpeech(params: Bundle?) {
-                Toast.makeText(this@VoiceReaderService, "சொல்லுங்கள் (நிறுத்து / சுருக்கு / மீண்டும் / வேகம்)...", Toast.LENGTH_SHORT).show()
+                Toast.makeText(this@VoiceReaderService, "சொல்லுங்கள் (நிறுத்து / சுருக்கு / அடுத்து / முந்தைய)...", Toast.LENGTH_SHORT).show()
             }
             override fun onResults(results: Bundle?) {
-                val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-                val cmd = matches?.firstOrNull()?.lowercase() ?: ""
-                handleVoiceCommand(cmd)
+                val cmd = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull()?.lowercase() ?: ""
+                when {
+                    cmd.contains("நிறுத்து") || cmd.contains("stop") -> stopEverything()
+                    cmd.contains("சுருக்கு") || cmd.contains("simplify") -> triggerAISimplify()
+                    cmd.contains("அடுத்து") || cmd.contains("next") -> jumpParagraph(1)
+                    cmd.contains("முந்தைய") || cmd.contains("back") -> jumpParagraph(-1)
+                    cmd.contains("வேகம்") || cmd.contains("fast") -> cycleSpeed()
+                    else -> if (isPaused) togglePauseResume()
+                }
             }
-            override fun onError(error: Int) {
-                Toast.makeText(this@VoiceReaderService, "புரியவில்லை, மீண்டும் முயற்சிக்கவும்", Toast.LENGTH_SHORT).show()
-            }
+            override fun onError(error: Int) { if (isPaused) togglePauseResume() }
             override fun onBeginningOfSpeech() {}
             override fun onRmsChanged(rmsdB: Float) {}
             override fun onBufferReceived(buffer: ByteArray?) {}
@@ -358,29 +508,7 @@ class VoiceReaderService : AccessibilityService(), TextToSpeech.OnInitListener {
             override fun onPartialResults(partialResults: Bundle?) {}
             override fun onEvent(eventType: Int, params: Bundle?) {}
         })
-
         speechRecognizer?.startListening(intent)
-    }
-
-    private fun handleVoiceCommand(cmd: String) {
-        when {
-            cmd.contains("நிறுத்து") || cmd.contains("stop") || cmd.contains("போதும்") -> stopEverything()
-            cmd.contains("மீண்டும்") || cmd.contains("replay") || cmd.contains("முதல்ல") -> replayFromStart()
-            cmd.contains("சுருக்கு") || cmd.contains("சுருக்கி") || cmd.contains("short") || cmd.contains("simplify") -> {
-                if (!isSimplifiedMode) toggleSimplifyMode() else replayFromStart()
-            }
-            cmd.contains("முழு") || cmd.contains("full") -> {
-                if (isSimplifiedMode) toggleSimplifyMode()
-            }
-            cmd.contains("வேகம்") || cmd.contains("வேகமா") || cmd.contains("fast") -> cycleSpeed()
-            cmd.contains("தொடர்") || cmd.contains("படி") || cmd.contains("resume") -> {
-                if (isPaused) togglePauseResume()
-            }
-            else -> {
-                Toast.makeText(this, "கட்டளை: $cmd", Toast.LENGTH_SHORT).show()
-                if (isPaused) togglePauseResume()
-            }
-        }
     }
 
     private fun stopEverything() {
@@ -390,20 +518,9 @@ class VoiceReaderService : AccessibilityService(), TextToSpeech.OnInitListener {
 
     private fun resetUIState() {
         isPaused = false
-        currentSentenceIndex = 0
-        controlBar.visibility = View.GONE
+        currentIndex = 0
+        controlPanel.visibility = View.GONE
         updateOrbColor("#6200EE")
-    }
-
-    private fun collectCleanBlocks(node: AccessibilityNodeInfo?, list: MutableList<String>) {
-        if (node == null || !node.isVisibleToUser) return
-        val txt = node.text?.toString()?.trim()
-        if (!txt.isNullOrBlank()) {
-            list.add(txt)
-        }
-        for (i in 0 until node.childCount) {
-            collectCleanBlocks(node.getChild(i), list)
-        }
     }
 
     private fun updateOrbColor(hexColor: String) {
@@ -411,11 +528,7 @@ class VoiceReaderService : AccessibilityService(), TextToSpeech.OnInitListener {
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
-
-    override fun onInterrupt() {
-        stopEverything()
-    }
-
+    override fun onInterrupt() { stopEverything() }
     override fun onDestroy() {
         super.onDestroy()
         if (::rootContainer.isInitialized) windowManager.removeView(rootContainer)
